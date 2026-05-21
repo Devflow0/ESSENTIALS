@@ -18,6 +18,10 @@ from db_security import encrypt_data, encrypt_bytes # Import the new helper
 app = FastAPI()
 DB_NAME = 'alpr_data.db'
 
+# ── Asset directories ─────────────────────────────────────────────────
+MODELS_DIR = os.path.join("assets", "Models")
+VIDEOS_DIR = os.path.join("assets", "videos")
+
 def _init_db():
     """Ensure all required tables exist before the server starts processing."""
     with sqlite3.connect(DB_NAME) as conn:
@@ -266,8 +270,8 @@ class GlobalAIWorker:
     def __init__(self):
         # Shared Models
         self.reader = easyocr.Reader(['en'], gpu=True)
-        self.coco_model = YOLO('yolov8n.pt')
-        self.plate_model = YOLO('license_plate_detector.pt')
+        self.coco_model = YOLO(os.path.join(MODELS_DIR, 'yolov8n.pt'))
+        self.plate_model = YOLO(os.path.join(MODELS_DIR, 'license_plate_detector.pt'))
         
         self.alert_queue = []
         self.lock = threading.Lock()
@@ -275,13 +279,17 @@ class GlobalAIWorker:
         self.refresh_watchlist()
         
         # Initialize Dual Cameras (Using the same video as a placeholder if separate sources aren't available)
-        self.entry_processor = CameraProcessor("ENTRY", "license_plate_video.mp4", self.coco_model, self.plate_model, self.reader, self)
-        self.exit_processor = CameraProcessor("EXIT", "license_plate_video.mp4", self.coco_model, self.plate_model, self.reader, self)
+        self.entry_processor = CameraProcessor("ENTRY", os.path.join(VIDEOS_DIR, "license_plate_video.mp4"), self.coco_model, self.plate_model, self.reader, self)
+        self.exit_processor  = CameraProcessor("EXIT",  os.path.join(VIDEOS_DIR, "license_plate_video.mp4"), self.coco_model, self.plate_model, self.reader, self)
 
         # Face Recognition
         try:
-            self.face_detector = cv2.FaceDetectorYN.create("face_detection_yunet.onnx", "", (320, 320))
-            self.face_recognizer = cv2.FaceRecognizerSF.create("face_recognition_sface.onnx", "")
+            self.face_detector  = cv2.FaceDetectorYN.create(
+                os.path.join(MODELS_DIR, "face_detection_yunet.onnx"), "", (320, 320)
+            )
+            self.face_recognizer = cv2.FaceRecognizerSF.create(
+                os.path.join(MODELS_DIR, "face_recognition_sface.onnx"), ""
+            )
         except Exception as e:
             print("Could not load face models:", e)
             self.face_detector, self.face_recognizer = None, None
@@ -293,7 +301,10 @@ class GlobalAIWorker:
         self.refresh_face_profiles()
         self.refresh_face_watchlist()
         if self.face_detector and self.face_recognizer:
-            self.face_processor = FaceProcessor("MAIN_ENTRY", "face_video.mp4", self.face_detector, self.face_recognizer, self)
+            self.face_processor = FaceProcessor(
+                "MAIN_ENTRY", os.path.join(VIDEOS_DIR, "face_video.mp4"),
+                self.face_detector, self.face_recognizer, self
+            )
 
     def refresh_watchlist(self):
         with sqlite3.connect(DB_NAME) as conn:

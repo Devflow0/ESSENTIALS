@@ -25,6 +25,9 @@ DB_NAME = 'alpr_data.db'
 SERVER_IP = get_local_ip()
 SERVER_URL = f"http://{SERVER_IP}:8000"
 
+# ── Asset directories ─────────────────────────────────────────────────
+MODELS_DIR = os.path.join("assets", "Models")
+
 def init_face_db():
     with sqlite3.connect(DB_NAME) as conn:
         conn.execute('''CREATE TABLE IF NOT EXISTS face_movements
@@ -117,8 +120,12 @@ def back_search_face_history(name: str, face_id: int, embedding_blob: bytes,
     Returns: {scanned: int, matched: int, updated: int} or adds 'error' key.
     """
     try:
-        detector  = cv2.FaceDetectorYN.create("face_detection_yunet.onnx", "", (320, 320))
-        recognizer = cv2.FaceRecognizerSF.create("face_recognition_sface.onnx", "")
+        detector  = cv2.FaceDetectorYN.create(
+            os.path.join(MODELS_DIR, "face_detection_yunet.onnx"), "", (320, 320)
+        )
+        recognizer = cv2.FaceRecognizerSF.create(
+            os.path.join(MODELS_DIR, "face_recognition_sface.onnx"), ""
+        )
     except Exception as exc:
         return {"scanned": 0, "matched": 0, "updated": 0, "error": str(exc)}
 
@@ -573,8 +580,12 @@ def register_person_dialog():
                 img        = cv2.imdecode(file_bytes, 1)
 
                 try:
-                    detector   = cv2.FaceDetectorYN.create("face_detection_yunet.onnx", "", (320, 320))
-                    recognizer = cv2.FaceRecognizerSF.create("face_recognition_sface.onnx", "")
+                    detector   = cv2.FaceDetectorYN.create(
+                        os.path.join(MODELS_DIR, "face_detection_yunet.onnx"), "", (320, 320)
+                    )
+                    recognizer = cv2.FaceRecognizerSF.create(
+                        os.path.join(MODELS_DIR, "face_recognition_sface.onnx"), ""
+                    )
 
                     h, w = img.shape[:2]
                     detector.setInputSize((w, h))
