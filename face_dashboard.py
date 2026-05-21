@@ -786,6 +786,292 @@ def face_roster_fragment():
                         st.rerun()
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Dialog: Register From Snapshot
+# ─────────────────────────────────────────────────────────────────────────────
+@st.dialog("Register Face from Snapshot", width="large")
+def register_from_snapshot_dialog(snap_path: str, suggested_name: str):
+    """
+    Let the operator register a face directly from an existing encrypted snapshot.
+    The image is decrypted, shown for review, then processed through YuNet+SFace
+    exactly like the standard upload-based registration.
+    """
+    img_bytes = get_decrypted_image(snap_path)
+    if img_bytes is None:
+        st.error("Could not decrypt this snapshot.")
+        return
+
+    try:
+        nparr = np.frombuffer(img_bytes, dtype=np.uint8)
+        frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    except Exception as exc:
+        st.error(f"Could not decode image: {exc}")
+        return
+
+    col_img, col_form = st.columns([1, 1])
+    with col_img:
+        st.image(img_bytes, caption=os.path.basename(snap_path), use_container_width=True)
+
+    with col_form:
+        name = st.text_input(
+            "Full Name",
+            value=suggested_name if suggested_name.upper() != "UNKNOWN" else "",
+            placeholder="Enter name to register…"
+        ).upper().strip()
+
+        run_bs = st.checkbox(
+            "🔎 Back-search historical records after registering",
+            value=True
+        )
+
+        if st.button("Extract Face & Register", type="primary", use_container_width=True,
+                     key="btn_reg_from_snap"):
+            if not name:
+                st.warning("Please enter a name before registering.")
+                return
+            try:
+                detector   = cv2.FaceDetectorYN.create(
+                    os.path.join(MODELS_DIR, "face_detection_yunet.onnx"), "", (320, 320)
+                )
+                recognizer = cv2.FaceRecognizerSF.create(
+                    os.path.join(MODELS_DIR, "face_recognition_sface.onnx"), ""
+                )
+                h, w = frame.shape[:2]
+                detector.setInputSize((w, h))
+                _, faces = detector.detect(frame)
+
+                if faces is not None and len(faces) > 0:
+                    face_align   = recognizer.alignCrop(frame, faces[0])
+                    face_feature = recognizer.feature(face_align)
+                    blob         = face_feature.tobytes()
+                    now_str      = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+                    with sqlite3.connect(DB_NAME) as conn:
+                        conn.execute('''
+                            INSERT INTO face_profiles (name, embedding, first_seen, last_seen, last_snapshot_path)
+                            VALUES (?, ?, ?, ?, ?)
+                            ON CONFLICT(name) DO UPDATE SET
+                                embedding=excluded.embedding,
+                                last_snapshot_path=excluded.last_snapshot_path
+                        ''', (name, blob, now_str, now_str, snap_path))
+                        conn.execute(
+                            "UPDATE face_profiles SET face_id = rowid "
+                            "WHERE name = ? AND face_id IS NULL", (name,)
+                        )
+                        _row = conn.execute(
+                            "SELECT face_id FROM face_profiles WHERE name = ?", (name,)
+                        ).fetchone()
+                        assigned_face_id = _row[0] if _row else None
+
+                    try:
+                        requests.post(f"{SERVER_URL}/refresh_face_profiles", timeout=2)
+                    except:
+                        pass
+
+                    st.success(f"✅ **{name}** registered — Face ID **#{assigned_face_id}**")
+
+                    if run_bs and assigned_face_id is not None:
+                        _prog = st.progress(0, text="Back-searching…")
+                        _res  = back_search_face_history(name, assigned_face_id, blob, _prog)
+                        _prog.empty()
+                        if _res.get("matched", 0) > 0:
+                            st.success(
+                                f"✅ Retroactively linked **{_res['matched']}** historical "
+                                f"sighting(s) to **{name}**."
+                            )
+                        else:
+                            st.info(f"Scanned {_res['scanned']} records — no prior matches.")
+
+                    if st.button("Done ✓", use_container_width=True, key="btn_done_snap_reg"):
+                        st.rerun()
+                else:
+                    st.error("No face detected in this snapshot. Try a clearer image.")
+            except Exception as exc:
+                st.error(f"Registration error: {exc}")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Fragment: Snapshot File Browser
+# ─────────────────────────────────────────────────────────────────────────────
+def _collect_snapshot_index(base_dir: str) -> list[dict]:
+    """
+    Walk snapshots/faces/YYYY/Month-YYYY/DD-MM-YYYY/HHMMSS_NAME.jpg
+    and return a list of metadata dicts.
+    """
+    records = []
+    if not os.path.isdir(base_dir):
+        return records
+    for year in sorted(os.listdir(base_dir)):
+        yr_path = os.path.join(base_dir, year)
+        if not os.path.isdir(yr_path):
+            continue
+        for month in sorted(os.listdir(yr_path)):
+            mo_path = os.path.join(yr_path, month)
+            if not os.path.isdir(mo_path):
+                continue
+            for day_folder in sorted(os.listdir(mo_path)):
+                day_path = os.path.join(mo_path, day_folder)
+                if not os.path.isdir(day_path):
+                    continue
+                # Parse date from folder name  "DD-MM-YYYY"
+                try:
+                    folder_date = datetime.strptime(day_folder, "%d-%m-%Y").date()
+                except ValueError:
+                    folder_date = None
+                for fname in sorted(os.listdir(day_path)):
+                    if not fname.lower().endswith(('.jpg', '.jpeg', '.png')):
+                        continue
+                    full_path = os.path.join(day_path, fname)
+                    # Parse time from filename  "HHMMSS_NAME.ext"
+                    stem = os.path.splitext(fname)[0]
+                    parts = stem.split("_", 1)
+                    time_str  = parts[0] if len(parts) > 0 else ""
+                    snap_name = parts[1] if len(parts) > 1 else "UNKNOWN"
+                    try:
+                        snap_time = datetime.strptime(time_str, "%H%M%S").strftime("%H:%M:%S")
+                    except ValueError:
+                        snap_time = time_str
+                    records.append({
+                        "date":      folder_date,
+                        "time":      snap_time,
+                        "name":      snap_name,
+                        "path":      full_path,
+                        "day_label": day_folder,
+                    })
+    return records
+
+@st.fragment
+def face_snapshot_browser():
+    SNAP_BASE = os.path.join("snapshots", "faces")
+    all_snaps = _collect_snapshot_index(SNAP_BASE)
+
+    if not all_snaps:
+        st.info(
+            "No face snapshots found. The system automatically saves encrypted snapshots "
+            f"to `{SNAP_BASE}/YYYY/Month-YYYY/DD-MM-YYYY/` during detection."
+        )
+        return
+
+    # ── Filters ───────────────────────────────────────────────────────────────
+    all_dates   = sorted({r["date"] for r in all_snaps if r["date"]}, reverse=True)
+    all_names   = sorted({r["name"] for r in all_snaps})
+    name_opts   = ["All", "UNKNOWN (unidentified)"] + [n for n in all_names if n != "UNKNOWN"]
+
+    fc1, fc2, fc3 = st.columns([2, 2, 1])
+    with fc1:
+        if all_dates:
+            date_filter = st.date_input(
+                "Filter by date",
+                value=all_dates[0],
+                min_value=all_dates[-1],
+                max_value=all_dates[0],
+                key="snap_date_filter",
+                label_visibility="collapsed"
+            )
+        else:
+            date_filter = None
+    with fc2:
+        name_filter = st.selectbox(
+            "Filter by person",
+            options=name_opts,
+            index=0,
+            key="snap_name_filter",
+            label_visibility="collapsed"
+        )
+    with fc3:
+        if st.button("🔄 Reset", key="btn_snap_reset", use_container_width=True):
+            st.session_state.pop("snap_date_filter", None)
+            st.session_state.pop("snap_name_filter", None)
+            st.rerun()
+
+    # Apply filters
+    filtered = all_snaps
+    if date_filter:
+        filtered = [r for r in filtered if r["date"] == date_filter]
+    if name_filter == "UNKNOWN (unidentified)":
+        filtered = [r for r in filtered if r["name"].upper() == "UNKNOWN"]
+    elif name_filter != "All":
+        filtered = [r for r in filtered if r["name"] == name_filter]
+
+    # Sort newest first
+    filtered = sorted(filtered, key=lambda r: (r["date"] or datetime.min.date(), r["time"]), reverse=True)
+
+    total = len(filtered)
+    st.caption(f"**{total}** snapshot(s) — "
+               f"{'all dates' if not date_filter else str(date_filter)}  ·  {name_filter}")
+
+    if total == 0:
+        st.info("No snapshots match the current filters.")
+        return
+
+    # ── Pagination ────────────────────────────────────────────────────────────
+    PAGE_SIZE = 16
+    total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+    if "snap_page" not in st.session_state:
+        st.session_state["snap_page"] = 0
+    # Reset page when filters change
+    page = st.session_state.get("snap_page", 0)
+    if page >= total_pages:
+        page = 0
+        st.session_state["snap_page"] = 0
+
+    page_snaps = filtered[page * PAGE_SIZE:(page + 1) * PAGE_SIZE]
+
+    # ── Photo grid ────────────────────────────────────────────────────────────
+    COLS = 4
+    for row_start in range(0, len(page_snaps), COLS):
+        row_snaps = page_snaps[row_start:row_start + COLS]
+        cols = st.columns(COLS)
+        for col, snap in zip(cols, row_snaps):
+            with col:
+                img = get_decrypted_image(snap["path"])
+                if img:
+                    st.image(img, use_container_width=True)
+                else:
+                    st.markdown(
+                        '<div style="background:#1e2530;border-radius:8px;'
+                        'height:90px;display:flex;align-items:center;'
+                        'justify-content:center;color:#555;font-size:28px;">👤</div>',
+                        unsafe_allow_html=True
+                    )
+                # Name badge (colour-coded)
+                badge_col = "#e74c3c" if snap["name"].upper() == "UNKNOWN" else "#27ae60"
+                st.markdown(
+                    f'<div style="background:{badge_col};color:#fff;border-radius:4px;'
+                    f'padding:2px 6px;font-size:11px;text-align:center;margin:2px 0;">'
+                    f'{snap["name"]}</div>',
+                    unsafe_allow_html=True
+                )
+                st.caption(f"{snap['day_label']}  {snap['time']}")
+
+                # Register button — only shown for unidentified or for re-registering
+                reg_key = f"reg_{snap['path'].replace(os.sep, '_').replace('.','_')}"
+                if st.button(
+                    "🪪 Register" if snap["name"].upper() == "UNKNOWN" else "✏️ Re-register",
+                    key=reg_key,
+                    use_container_width=True
+                ):
+                    register_from_snapshot_dialog(snap["path"], snap["name"])
+
+    # ── Pagination controls ───────────────────────────────────────────────────
+    if total_pages > 1:
+        pg1, pg2, pg3 = st.columns([1, 3, 1])
+        with pg1:
+            if st.button("◀ Prev", key="snap_prev",
+                         disabled=(page == 0), use_container_width=True):
+                st.session_state["snap_page"] = page - 1
+                st.rerun()
+        with pg2:
+            st.markdown(
+                f"<div style='text-align:center;padding-top:8px;'>"
+                f"Page {page+1} of {total_pages}</div>",
+                unsafe_allow_html=True
+            )
+        with pg3:
+            if st.button("Next ▶", key="snap_next",
+                         disabled=(page >= total_pages - 1), use_container_width=True):
+                st.session_state["snap_page"] = page + 1
+                st.rerun()
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Main entry point
 # ─────────────────────────────────────────────────────────────────────────────
 def face_ui():
@@ -805,3 +1091,7 @@ def face_ui():
 
     with st.expander("👤 Face Intelligence", expanded=True):
         face_intel_fragment()
+
+    st.divider()
+    with st.expander("🗂️ Face Snapshot Browser", expanded=False):
+        face_snapshot_browser()
