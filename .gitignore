@@ -1,2 +1,5 @@
 .streamlit/
 snapshots/
+*.db
+*.sqlite
+*.sqlite3
