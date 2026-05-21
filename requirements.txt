@@ -1,0 +1,14 @@
+streamlit
+opencv-python
+ultralytics
+easyocr
+pandas
+openpyxl
+plotly
+numpy
+groq
+cryptography
+requests
+streamlit-mic-recorder
+fastapi
+uvicorn
