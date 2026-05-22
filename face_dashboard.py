@@ -224,7 +224,7 @@ def back_search_face_history(name: str, face_id: int, embedding_blob: bytes,
 # ─────────────────────────────────────────────────────────────────────────────
 # Fragment: Face Intelligence (profiles + history + similar faces)
 # ─────────────────────────────────────────────────────────────────────────────
-@st.fragment(run_every=8.0)
+@st.fragment
 def face_intel_fragment():
     # ── Load profiles ─────────────────────────────────────────────────────────
     with sqlite3.connect(DB_NAME) as conn:
@@ -238,8 +238,8 @@ def face_intel_fragment():
         st.info("No known faces registered. Use the Register Person button to add some.")
         return
 
-    # ── Compact toolbar: name search + back-search button on one row ──────────
-    tc1, tc2 = st.columns([3, 1])
+    # ── Compact toolbar: name search + back-search + refresh ─────────────────
+    tc1, tc2, tc3 = st.columns([3, 1, 1])
     with tc1:
         name_search = st.text_input(
             "Search", key="face_search",
@@ -252,6 +252,9 @@ def face_intel_fragment():
             use_container_width=True,
             help="Re-scan unattributed snapshots for the selected person"
         )
+    with tc3:
+        if st.button("🔄 Refresh", key="btn_intel_refresh", use_container_width=True):
+            st.rerun()
 
     filtered = profiles.copy()
     if name_search:
@@ -987,6 +990,12 @@ def _collect_snapshot_index(base_dir: str) -> list[dict]:
 
 @st.fragment
 def face_snapshot_browser():
+    # ── Manual refresh button ─────────────────────────────────────────────────
+    _sc1, _sc2 = st.columns([5, 1])
+    with _sc2:
+        if st.button("🔄 Refresh", key="btn_snap_refresh", use_container_width=True):
+            st.session_state.pop("snap_page", None)  # reset to page 1 on refresh
+            st.rerun()
     SNAP_BASE = os.path.join("snapshots", "faces")
     all_snaps = _collect_snapshot_index(SNAP_BASE)
 
