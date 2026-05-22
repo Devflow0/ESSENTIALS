@@ -693,6 +693,158 @@ def alert_listener():
 # ─────────────────────────────────────────────────────────────────────────────
 # Fragment: Face Roster (inline gallery after Register button)
 # ─────────────────────────────────────────────────────────────────────────────
+@st.dialog("Register Face from Snapshot", width="large")
+def register_from_snapshot_dialog(snap_path: str, suggested_name: str):
+    """
+    Register a face from an encrypted snapshot.
+    Detects ALL faces in the image, lets the operator pick which one to register,
+    then extracts the embedding for that face only.
+    """
+    img_bytes = get_decrypted_image(snap_path)
+    if img_bytes is None:
+        st.error("Could not decrypt this snapshot.")
+        return
+
+    try:
+        nparr = np.frombuffer(img_bytes, dtype=np.uint8)
+        frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    except Exception as exc:
+        st.error(f"Could not decode image: {exc}")
+        return
+
+    # ── Detect all faces ──────────────────────────────────────────────────────
+    try:
+        detector   = cv2.FaceDetectorYN.create(
+            os.path.join(MODELS_DIR, "face_detection_yunet.onnx"), "", (320, 320)
+        )
+        recognizer = cv2.FaceRecognizerSF.create(
+            os.path.join(MODELS_DIR, "face_recognition_sface.onnx"), ""
+        )
+    except Exception as exc:
+        st.error(f"Could not load face models: {exc}")
+        return
+
+    h, w = frame.shape[:2]
+    detector.setInputSize((w, h))
+    _, faces = detector.detect(frame)
+
+    if faces is None or len(faces) == 0:
+        st.error("No face detected in this snapshot — try a clearer image.")
+        col_img, _ = st.columns([1, 1])
+        with col_img:
+            st.image(img_bytes, use_container_width=True)
+        return
+
+    num_faces = len(faces)
+
+    # ── Draw numbered bounding boxes on a copy ────────────────────────────────
+    COLOURS = [
+        (0, 220, 90),   # green  – face 1
+        (30, 130, 255),  # orange – face 2
+        (220, 40, 220),  # purple – face 3
+        (0, 210, 255),  # yellow – face 4
+        (220, 50, 50),  # blue   – face 5+
+    ]
+    annotated = frame.copy()
+    for idx, face in enumerate(faces):
+        x, y, fw, fh = int(face[0]), int(face[1]), int(face[2]), int(face[3])
+        colour = COLOURS[idx % len(COLOURS)]
+        cv2.rectangle(annotated, (x, y), (x + fw, y + fh), colour, 3)
+        label = f"#{idx + 1}"
+        (lw, lh), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.9, 2)
+        cv2.rectangle(annotated, (x, y - lh - 10), (x + lw + 8, y), colour, -1)
+        cv2.putText(annotated, label, (x + 4, y - 6),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
+
+    _, ann_buf = cv2.imencode('.jpg', annotated)
+    ann_bytes  = ann_buf.tobytes()
+
+    # ── Layout ────────────────────────────────────────────────────────────────
+    col_img, col_form = st.columns([1, 1])
+
+    with col_img:
+        st.image(ann_bytes, caption=f"{num_faces} face(s) detected", use_container_width=True)
+
+    with col_form:
+        # Face selector — only shown when there are multiple faces
+        if num_faces > 1:
+            face_options = [f"Face #{i+1}" for i in range(num_faces)]
+            chosen_label = st.radio(
+                "Which face to register?",
+                options=face_options,
+                horizontal=True,
+                key="snap_face_radio"
+            )
+            chosen_idx = face_options.index(chosen_label)
+        else:
+            chosen_idx = 0
+            st.caption("✅ 1 face detected — ready to register.")
+
+        name = st.text_input(
+            "Full Name",
+            value=suggested_name if suggested_name.upper() != "UNKNOWN" else "",
+            placeholder="Enter name to register…"
+        ).upper().strip()
+
+        run_bs = st.checkbox(
+            "🔎 Back-search historical records after registering",
+            value=True
+        )
+
+        if st.button("Extract Face & Register", type="primary", use_container_width=True,
+                     key="btn_reg_from_snap"):
+            if not name:
+                st.warning("Please enter a name before registering.")
+                return
+            try:
+                chosen_face  = faces[chosen_idx]
+                face_align   = recognizer.alignCrop(frame, chosen_face)
+                face_feature = recognizer.feature(face_align)
+                blob         = face_feature.tobytes()
+                now_str      = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+                with sqlite3.connect(DB_NAME) as conn:
+                    conn.execute('''
+                        INSERT INTO face_profiles
+                            (name, embedding, first_seen, last_seen, last_snapshot_path)
+                        VALUES (?, ?, ?, ?, ?)
+                        ON CONFLICT(name) DO UPDATE SET
+                            embedding=excluded.embedding,
+                            last_snapshot_path=excluded.last_snapshot_path
+                    ''', (name, blob, now_str, now_str, snap_path))
+                    conn.execute(
+                        "UPDATE face_profiles SET face_id = rowid "
+                        "WHERE name = ? AND face_id IS NULL", (name,)
+                    )
+                    _row = conn.execute(
+                        "SELECT face_id FROM face_profiles WHERE name = ?", (name,)
+                    ).fetchone()
+                    assigned_face_id = _row[0] if _row else None
+
+                try:
+                    requests.post(f"{SERVER_URL}/refresh_face_profiles", timeout=2)
+                except:
+                    pass
+
+                st.success(f"✅ **{name}** registered — Face ID **#{assigned_face_id}**")
+
+                if run_bs and assigned_face_id is not None:
+                    _prog = st.progress(0, text="Back-searching…")
+                    _res  = back_search_face_history(name, assigned_face_id, blob, _prog)
+                    _prog.empty()
+                    if _res.get("matched", 0) > 0:
+                        st.success(
+                            f"✅ Retroactively linked **{_res['matched']}** historical "
+                            f"sighting(s) to **{name}**."
+                        )
+                    else:
+                        st.info(f"Scanned {_res['scanned']} records — no prior matches.")
+
+                if st.button("Done ✓", use_container_width=True, key="btn_done_snap_reg"):
+                    st.rerun()
+            except Exception as exc:
+                st.error(f"Registration error: {exc}")
+
 @st.fragment(run_every=10.0)
 def face_roster_fragment():
     """
@@ -760,9 +912,7 @@ def face_roster_fragment():
                                 "DELETE FROM face_watchlist WHERE name=?", (name,)
                             )
                         try:
-                            requests.post(
-                                f"{SERVER_URL}/refresh_face_profiles", timeout=2
-                            )
+                            requests.post(f"{SERVER_URL}/refresh_face_watchlist", timeout=2)
                         except:
                             pass
                         st.rerun()
@@ -778,117 +928,14 @@ def face_roster_fragment():
                                  datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
                             )
                         try:
-                            requests.post(
-                                f"{SERVER_URL}/refresh_face_profiles", timeout=2
-                            )
+                            requests.post(f"{SERVER_URL}/refresh_face_watchlist", timeout=2)
                         except:
                             pass
                         st.rerun()
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Dialog: Register From Snapshot
-# ─────────────────────────────────────────────────────────────────────────────
-@st.dialog("Register Face from Snapshot", width="large")
-def register_from_snapshot_dialog(snap_path: str, suggested_name: str):
-    """
-    Let the operator register a face directly from an existing encrypted snapshot.
-    The image is decrypted, shown for review, then processed through YuNet+SFace
-    exactly like the standard upload-based registration.
-    """
-    img_bytes = get_decrypted_image(snap_path)
-    if img_bytes is None:
-        st.error("Could not decrypt this snapshot.")
-        return
-
-    try:
-        nparr = np.frombuffer(img_bytes, dtype=np.uint8)
-        frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-    except Exception as exc:
-        st.error(f"Could not decode image: {exc}")
-        return
-
-    col_img, col_form = st.columns([1, 1])
-    with col_img:
-        st.image(img_bytes, caption=os.path.basename(snap_path), use_container_width=True)
-
-    with col_form:
-        name = st.text_input(
-            "Full Name",
-            value=suggested_name if suggested_name.upper() != "UNKNOWN" else "",
-            placeholder="Enter name to register…"
-        ).upper().strip()
-
-        run_bs = st.checkbox(
-            "🔎 Back-search historical records after registering",
-            value=True
-        )
-
-        if st.button("Extract Face & Register", type="primary", use_container_width=True,
-                     key="btn_reg_from_snap"):
-            if not name:
-                st.warning("Please enter a name before registering.")
-                return
-            try:
-                detector   = cv2.FaceDetectorYN.create(
-                    os.path.join(MODELS_DIR, "face_detection_yunet.onnx"), "", (320, 320)
-                )
-                recognizer = cv2.FaceRecognizerSF.create(
-                    os.path.join(MODELS_DIR, "face_recognition_sface.onnx"), ""
-                )
-                h, w = frame.shape[:2]
-                detector.setInputSize((w, h))
-                _, faces = detector.detect(frame)
-
-                if faces is not None and len(faces) > 0:
-                    face_align   = recognizer.alignCrop(frame, faces[0])
-                    face_feature = recognizer.feature(face_align)
-                    blob         = face_feature.tobytes()
-                    now_str      = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-                    with sqlite3.connect(DB_NAME) as conn:
-                        conn.execute('''
-                            INSERT INTO face_profiles (name, embedding, first_seen, last_seen, last_snapshot_path)
-                            VALUES (?, ?, ?, ?, ?)
-                            ON CONFLICT(name) DO UPDATE SET
-                                embedding=excluded.embedding,
-                                last_snapshot_path=excluded.last_snapshot_path
-                        ''', (name, blob, now_str, now_str, snap_path))
-                        conn.execute(
-                            "UPDATE face_profiles SET face_id = rowid "
-                            "WHERE name = ? AND face_id IS NULL", (name,)
-                        )
-                        _row = conn.execute(
-                            "SELECT face_id FROM face_profiles WHERE name = ?", (name,)
-                        ).fetchone()
-                        assigned_face_id = _row[0] if _row else None
-
-                    try:
-                        requests.post(f"{SERVER_URL}/refresh_face_profiles", timeout=2)
-                    except:
-                        pass
-
-                    st.success(f"✅ **{name}** registered — Face ID **#{assigned_face_id}**")
-
-                    if run_bs and assigned_face_id is not None:
-                        _prog = st.progress(0, text="Back-searching…")
-                        _res  = back_search_face_history(name, assigned_face_id, blob, _prog)
-                        _prog.empty()
-                        if _res.get("matched", 0) > 0:
-                            st.success(
-                                f"✅ Retroactively linked **{_res['matched']}** historical "
-                                f"sighting(s) to **{name}**."
-                            )
-                        else:
-                            st.info(f"Scanned {_res['scanned']} records — no prior matches.")
-
-                    if st.button("Done ✓", use_container_width=True, key="btn_done_snap_reg"):
-                        st.rerun()
-                else:
-                    st.error("No face detected in this snapshot. Try a clearer image.")
-            except Exception as exc:
-                st.error(f"Registration error: {exc}")
 
 # ─────────────────────────────────────────────────────────────────────────────
+
 # Fragment: Snapshot File Browser
 # ─────────────────────────────────────────────────────────────────────────────
 def _collect_snapshot_index(base_dir: str) -> list[dict]:

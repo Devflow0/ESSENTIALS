@@ -463,6 +463,11 @@ async def api_refresh_face_profiles():
         worker.refresh_face_profiles()
     return {"status": "ok"}
 
+@app.post("/refresh_face_watchlist")
+async def api_refresh_face_watchlist():
+    worker.refresh_face_watchlist()
+    return {"status": "ok"}
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
