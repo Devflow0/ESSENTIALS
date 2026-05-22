@@ -249,7 +249,7 @@ class FaceProcessor:
                         else:
                             save_frame = frame
                         
-                        success, buffer = cv2.imencode('.jpg', save_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 60])
+                        success, buffer = cv2.imencode('.jpg', save_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
                         if success:
                             encrypted_img = encrypt_bytes(buffer.tobytes())
                             with open(snap_path, 'wb') as f:

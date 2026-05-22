@@ -110,28 +110,37 @@ def get_analytics_data():
         df['day_name'] = df['timestamp'].dt.day_name()
     return df
 
-@st.fragment(run_every=8.0)
+@st.fragment
 def vehicle_intel_fragment():
     """Unified vehicle intelligence panel: profiles, movement history, snapshots."""
 
-    # ── Load profiles ────────────────────────────────────────────────
-    with sqlite3.connect(DB_NAME) as conn:
-        profiles = pd.read_sql_query(
-            "SELECT plate, first_seen, last_seen, total_visits, total_entries, total_exits "
-            "FROM vehicle_profiles ORDER BY last_seen DESC",
-            conn
-        )
+    # ── Single search bar and manual refresh ─────────────────────────
+    vc1, vc2 = st.columns([5, 1])
+    with vc1:
+        search = st.text_input(
+            "Search vehicle", key="vi_search",
+            placeholder="Type a plate to filter… (e.g. ABC123)",
+            label_visibility="collapsed"
+        ).upper().strip()
+    with vc2:
+        if st.button("🔄 Refresh", key="btn_vi_refresh", use_container_width=True):
+            st.session_state.pop("_vehicle_intel_cache", None)
+            st.rerun()
+
+    # ── Load profiles (cached until Refresh is clicked) ──────────────
+    if "_vehicle_intel_cache" not in st.session_state:
+        with sqlite3.connect(DB_NAME) as conn:
+            st.session_state["_vehicle_intel_cache"] = pd.read_sql_query(
+                "SELECT plate, first_seen, last_seen, total_visits, total_entries, total_exits "
+                "FROM vehicle_profiles ORDER BY last_seen DESC",
+                conn
+            )
+            
+    profiles = st.session_state["_vehicle_intel_cache"]
 
     if profiles.empty:
         st.info("No vehicle profiles yet. They are built automatically as vehicles are detected.")
         return
-
-    # ── Single search bar filters everything ─────────────────────────
-    search = st.text_input(
-        "Search vehicle", key="vi_search",
-        placeholder="Type a plate to filter… (e.g. ABC123)",
-        label_visibility="collapsed"
-    ).upper().strip()
 
     filtered = profiles[profiles['plate'].str.contains(search, na=False)] if search else profiles
     st.caption(f"{len(filtered)} of {len(profiles)} vehicle(s) shown")
@@ -192,7 +201,7 @@ def vehicle_intel_fragment():
                         hide_index=True,
                         on_select="rerun",
                         selection_mode="single-row",
-                        key="vi_history_table",
+                        key=f"vi_history_table_{selected_plate}",
                         height=220
                     )
 

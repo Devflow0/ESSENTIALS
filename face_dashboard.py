@@ -224,15 +224,17 @@ def back_search_face_history(name: str, face_id: int, embedding_blob: bytes,
 # ─────────────────────────────────────────────────────────────────────────────
 # Fragment: Face Intelligence (profiles + history + similar faces)
 # ─────────────────────────────────────────────────────────────────────────────
-@st.fragment
-def face_intel_fragment():
-    # ── Load profiles ─────────────────────────────────────────────────────────
-    with sqlite3.connect(DB_NAME) as conn:
-        profiles = pd.read_sql_query(
-            "SELECT face_id, name, first_seen, last_seen, total_visits "
-            "FROM face_profiles ORDER BY last_seen DESC",
-            conn
-        )
+@st.dialog("👤 Face Intelligence", width="large")
+def face_intel_dialog():
+    # -- Load profiles (cached -- only rebuilt when Refresh is clicked) --------
+    if "_intel_cache" not in st.session_state:
+        with sqlite3.connect(DB_NAME) as conn:
+            st.session_state["_intel_cache"] = pd.read_sql_query(
+                "SELECT face_id, name, first_seen, last_seen, total_visits "
+                "FROM face_profiles ORDER BY last_seen DESC",
+                conn
+            )
+    profiles = st.session_state["_intel_cache"]
 
     if profiles.empty:
         st.info("No known faces registered. Use the Register Person button to add some.")
@@ -254,7 +256,8 @@ def face_intel_fragment():
         )
     with tc3:
         if st.button("🔄 Refresh", key="btn_intel_refresh", use_container_width=True):
-            st.rerun()
+            st.session_state.pop("_intel_cache", None)
+            # st.rerun()
 
     filtered = profiles.copy()
     if name_search:
@@ -365,7 +368,7 @@ def face_intel_fragment():
                         hide_index=True,
                         on_select="rerun",
                         selection_mode="single-row",
-                        key="face_history_table",
+                        key=f"face_history_table_{selected_face_id}",
                         height=160
                     )
                 with ht2:
@@ -718,7 +721,8 @@ def register_from_snapshot_dialog(snap_path: str, suggested_name: str):
     # ── Detect all faces ──────────────────────────────────────────────────────
     try:
         detector   = cv2.FaceDetectorYN.create(
-            os.path.join(MODELS_DIR, "face_detection_yunet.onnx"), "", (320, 320)
+            os.path.join(MODELS_DIR, "face_detection_yunet.onnx"), "", (320, 320),
+            score_threshold=0.8
         )
         recognizer = cv2.FaceRecognizerSF.create(
             os.path.join(MODELS_DIR, "face_recognition_sface.onnx"), ""
@@ -848,8 +852,8 @@ def register_from_snapshot_dialog(snap_path: str, suggested_name: str):
             except Exception as exc:
                 st.error(f"Registration error: {exc}")
 
-@st.fragment(run_every=10.0)
-def face_roster_fragment():
+@st.dialog("Registered Faces", width="large")
+def face_roster_dialog():
     """
     Compact inline gallery displayed directly below the Register button.
     Shows every registered face with their photo, name, Face ID and watchlist status.
@@ -918,7 +922,7 @@ def face_roster_fragment():
                             requests.post(f"{SERVER_URL}/refresh_face_watchlist", timeout=2)
                         except:
                             pass
-                        st.rerun()
+                        # st.rerun()
                 else:
                     if st.button("➕ Watchlist", key=wl_key,
                                  use_container_width=True,
@@ -934,7 +938,7 @@ def face_roster_fragment():
                             requests.post(f"{SERVER_URL}/refresh_face_watchlist", timeout=2)
                         except:
                             pass
-                        st.rerun()
+                        # st.rerun()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -988,16 +992,67 @@ def _collect_snapshot_index(base_dir: str) -> list[dict]:
                     })
     return records
 
-@st.fragment
-def face_snapshot_browser():
-    # ── Manual refresh button ─────────────────────────────────────────────────
+@st.dialog("🗑️ Bulk Delete Old Snapshots")
+def bulk_delete_snapshots_dialog():
+    st.write("Free up space by deleting old face snapshots from disk and the movement history database.")
+    del_c1, del_c2 = st.columns([1, 1])
+    with del_c1:
+        del_option = st.selectbox("Select Time Range", [
+            "Select range...",
+            "Older than 3 months",
+            "Older than 6 months",
+            "Older than 1 year",
+            "Custom Date"
+        ], key="del_snap_range")
+    
+    target_date = None
+    if del_option == "Older than 3 months":
+        target_date = datetime.now().date() - timedelta(days=90)
+    elif del_option == "Older than 6 months":
+        target_date = datetime.now().date() - timedelta(days=180)
+    elif del_option == "Older than 1 year":
+        target_date = datetime.now().date() - timedelta(days=365)
+    elif del_option == "Custom Date":
+        with del_c2:
+            target_date = st.date_input("Delete snapshots older than", key="del_snap_custom")
+
+    if target_date and del_option != "Select range...":
+        if st.button(f"Delete snapshots older than {target_date.strftime('%Y-%m-%d')}", type="primary", key="btn_del_snaps"):
+            # 1. Delete from DB
+            with sqlite3.connect(DB_NAME) as conn:
+                conn.execute("DELETE FROM face_movements WHERE date(timestamp) < ?", (target_date.strftime('%Y-%m-%d'),))
+            
+            # 2. Delete files
+            SNAP_BASE = os.path.join("snapshots", "faces")
+            all_snaps = _collect_snapshot_index(SNAP_BASE)
+            deleted_files = 0
+            for snap in all_snaps:
+                if snap['date'] and snap['date'] < target_date:
+                    try:
+                        os.remove(snap['path'])
+                        deleted_files += 1
+                    except: pass
+            
+            st.success(f"Deleted {deleted_files} snapshots and their database records.")
+            st.session_state.pop("_snap_cache", None)
+            st.rerun()
+
+@st.dialog("🗂️ Face Snapshot Browser", width="large")
+def face_snapshot_browser_dialog():
+    SNAP_BASE = os.path.join("snapshots", "faces")
+
+    # ── Refresh button: only this button rescans the disk ────────────────────
     _sc1, _sc2 = st.columns([5, 1])
     with _sc2:
         if st.button("🔄 Refresh", key="btn_snap_refresh", use_container_width=True):
-            st.session_state.pop("snap_page", None)  # reset to page 1 on refresh
-            st.rerun()
-    SNAP_BASE = os.path.join("snapshots", "faces")
-    all_snaps = _collect_snapshot_index(SNAP_BASE)
+            st.session_state.pop("_snap_cache", None)   # invalidate cache
+            st.session_state.pop("snap_page", None)     # reset to page 1
+
+    # ── Use cached index; rebuild only when cache is absent ──────────────────
+    if "_snap_cache" not in st.session_state:
+        st.session_state["_snap_cache"] = _collect_snapshot_index(SNAP_BASE)
+
+    all_snaps = st.session_state["_snap_cache"]
 
     if not all_snaps:
         st.info(
@@ -1036,7 +1091,7 @@ def face_snapshot_browser():
         if st.button("🔄 Reset", key="btn_snap_reset", use_container_width=True):
             st.session_state.pop("snap_date_filter", None)
             st.session_state.pop("snap_name_filter", None)
-            st.rerun()
+            # st.rerun()
 
     # Apply filters
     filtered = all_snaps
@@ -1063,7 +1118,6 @@ def face_snapshot_browser():
     total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
     if "snap_page" not in st.session_state:
         st.session_state["snap_page"] = 0
-    # Reset page when filters change
     page = st.session_state.get("snap_page", 0)
     if page >= total_pages:
         page = 0
@@ -1098,7 +1152,7 @@ def face_snapshot_browser():
                 )
                 st.caption(f"{snap['day_label']}  {snap['time']}")
 
-                # Register button — only shown for unidentified or for re-registering
+                # Register button — does NOT rebuild the snapshot list
                 reg_key = f"reg_{snap['path'].replace(os.sep, '_').replace('.','_')}"
                 if st.button(
                     "🪪 Register" if snap["name"].upper() == "UNKNOWN" else "✏️ Re-register",
@@ -1114,7 +1168,7 @@ def face_snapshot_browser():
             if st.button("◀ Prev", key="snap_prev",
                          disabled=(page == 0), use_container_width=True):
                 st.session_state["snap_page"] = page - 1
-                st.rerun()
+                # st.rerun()
         with pg2:
             st.markdown(
                 f"<div style='text-align:center;padding-top:8px;'>"
@@ -1125,7 +1179,8 @@ def face_snapshot_browser():
             if st.button("Next ▶", key="snap_next",
                          disabled=(page >= total_pages - 1), use_container_width=True):
                 st.session_state["snap_page"] = page + 1
-                st.rerun()
+                # st.rerun()
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Main entry point
@@ -1135,19 +1190,25 @@ def face_ui():
     alert_listener()
     ui_utils.icon_header("Face Recognition & Access", "users")
 
-    if st.button("Register New Person", type="primary", use_container_width=True):
-        register_person_dialog()
-
-    # Inline face roster: photo cards with watchlist control
-    face_roster_fragment()
+    btn_col1, btn_col2 = st.columns(2)
+    with btn_col1:
+        if st.button("Register New Person", type="primary", use_container_width=True):
+            register_person_dialog()
+    with btn_col2:
+        if st.button("View Registered Faces", use_container_width=True):
+            face_roster_dialog()
 
     st.divider()
     live_monitor_fragment()
     st.divider()
 
-    with st.expander("👤 Face Intelligence", expanded=True):
-        face_intel_fragment()
-
-    st.divider()
-    with st.expander("🗂️ Face Snapshot Browser", expanded=False):
-        face_snapshot_browser()
+    btn_col3, btn_col4, btn_col5 = st.columns(3)
+    with btn_col3:
+        if st.button("👤 Face Intelligence", use_container_width=True):
+            face_intel_dialog()
+    with btn_col4:
+        if st.button("🗂️ Face Snapshot Browser", use_container_width=True):
+            face_snapshot_browser_dialog()
+    with btn_col5:
+        if st.button("🗑️ Bulk Delete Old Snapshots", use_container_width=True):
+            bulk_delete_snapshots_dialog()
